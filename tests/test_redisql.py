@@ -1,6 +1,7 @@
 import socket
 import sqlite3
 import subprocess
+import threading
 import time
 
 import pytest
@@ -181,6 +182,26 @@ def test_oversized_write_rejected_and_redis_unchanged(make_client):
     assert a.query("select x from t") == [(1,)]
     b.sync()
     assert b.query("select x from t") == [(1,)]
+
+
+def test_query_returns_while_write_fn_is_running(make_client):
+    a = make_client(listen=False)
+    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (1)")))
+    started, release = threading.Event(), threading.Event()
+
+    def slow(c):
+        started.set()
+        release.wait(2)
+        c.execute("insert into t values (2)")
+
+    w = threading.Thread(target=a.write, args=(slow,))
+    w.start()
+    assert started.wait(2)
+    assert a.query("select x from t") == [(1,)]
+    assert w.is_alive()  # the query didn't have to wait for the write to finish
+    release.set()
+    w.join(2)
+    assert a.query("select x from t") == [(1,), (2,)]
 
 
 def test_local_writes_push_once_on_snapshot(make_client):

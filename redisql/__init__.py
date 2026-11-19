@@ -72,28 +72,34 @@ class RediSQL:
         sync and re-run fn (so fn may run more than once); raise Conflict after `retries` tries.
         """
         for _ in range(self.retries):
-            with self._lock:
-                # fn runs on a copy that replaces our DB only once Redis has it, so a failed
-                # push or a conflict leaves local data untouched.
-                db, new = self._copy_and_push(fn)
-                if db:
-                    self._db, old = db, self._db
-                    old.close()
-                    self.version, self._dirty = new, False
-                    return
-                if self._dirty:  # sync() won't load past unpushed local() work, so retrying can't help
-                    raise Conflict("another client wrote first; snapshot() to overwrite with local changes")
+            pushed = self._copy_and_push(fn)
+            if pushed:
+                db, new, base = pushed
+                with self._lock:
+                    # If sync() already loaded a later version, it includes our push; keep that.
+                    if self.version == base:
+                        self._db, old = db, self._db
+                        old.close()
+                        self.version, self._dirty = new, False
+                    else:
+                        db.close()
+                return
+            if self._dirty:  # sync() won't load past unpushed local() work, so retrying can't help
+                raise Conflict("another client wrote first; snapshot() to overwrite with local changes")
             self.sync()
         raise Conflict(f"gave up after {self.retries} attempts")
 
     def _copy_and_push(self, fn):
-        """Run fn on a copy of the local DB and push it if Redis still holds our version.
+        """Run fn on a copy of the local DB and push it if Redis still holds the version we copied.
 
-        Returns (copy, new version), or (None, None) if another client wrote first.
+        Returns (copy, new version, base version), or None if another client wrote first.
+        The lock is held only while copying, so query() isn't blocked while fn runs or the push happens.
         """
         db = sqlite3.connect(":memory:", check_same_thread=False)
         try:
-            self._db.backup(db)
+            with self._lock:
+                base = self.version
+                self._db.backup(db)
             with db:
                 fn(db)
             db.execute("pragma query_only=1")
@@ -101,13 +107,12 @@ class RediSQL:
             if len(raw) > self.max_size:  # other clients would reject it on every sync
                 raise ValueError(f"snapshot larger than max_size={self.max_size}")
             new = uuid.uuid4().hex.encode()
-            if self._push(keys=self._keys, args=[self.version, zlib.compress(raw), new]):
-                return db, new
+            if self._push(keys=self._keys, args=[base, zlib.compress(raw), new]):
+                return db, new, base
         except BaseException:
             db.close()
             raise
         db.close()
-        return None, None
 
     def local(self, fn):
         """Run fn(conn) on the local DB only. Nothing reaches Redis until snapshot().
