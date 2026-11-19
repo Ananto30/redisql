@@ -235,7 +235,7 @@ def test_batch_keeps_query_and_sync_running_while_open(make_client):
     with b.batch() as c:
         c.execute("insert into t values (1)")
         assert b.query("select x from t") == []  # batch work isn't visible yet
-        a.write(lambda c: c.execute("insert into t values (2)"))
+        a.write(lambda c: c.execute("insert into t values (2)"), lock=False)
         assert wait_for(lambda: b.query("select x from t") == [(2,)])  # sync still loads remote writes
 
 
@@ -245,7 +245,7 @@ def test_batch_warns_when_it_erases_another_clients_write(make_client, caplog):
     b.sync()
     with caplog.at_level("WARNING"):
         with a.batch() as c:
-            b.write(lambda c: c.execute("insert into t values (1)"))
+            b.write(lambda c: c.execute("insert into t values (1)"), lock=False)
             c.execute("insert into t values (2)")
     assert "overwr" in caplog.text.lower()
     assert make_client().query("select x from t") == [(2,)]
@@ -269,3 +269,67 @@ def test_oversized_batch_rejected(make_client):
             c.execute("insert into t values (zeroblob(100000))")
     assert a.redis.get("t:ver") == ver
     assert a.query("select x from t") == []
+
+
+def test_second_client_gets_conflict_while_write_lock_is_held(make_client):
+    a, b = make_client(listen=False), make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    b.sync()
+    calls = []
+    with a.batch():
+        with pytest.raises(Conflict):
+            b.write(lambda c: calls.append(1))
+        with pytest.raises(Conflict):
+            with b.batch():
+                calls.append(1)
+    assert calls == []
+    b.write(lambda c: c.execute("insert into t values (1)"))  # lock was released
+
+
+def test_lock_false_skips_the_write_lock(make_client):
+    a, b = make_client(listen=False), make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    b.sync()
+    with a.batch():
+        b.write(lambda c: c.execute("insert into t values (1)"), lock=False)
+        with b.batch(lock=False) as c:
+            c.execute("insert into t values (2)")
+
+
+def test_locked_batch_builds_on_latest_snapshot(make_client, caplog):
+    a, b = make_client(listen=False), make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    b.sync()
+    a.write(lambda c: c.execute("insert into t values (1)"))  # b hasn't seen this
+    with caplog.at_level("WARNING"):
+        with b.batch() as c:
+            c.execute("insert into t values (2)")
+    assert not caplog.records
+    a.sync()
+    assert sorted(a.query("select x from t")) == [(1,), (2,)]
+
+
+def test_lock_released_when_write_or_batch_fails(make_client):
+    a, b = make_client(listen=False), make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    b.sync()
+
+    def bad(c):
+        raise RuntimeError
+
+    with pytest.raises(RuntimeError):
+        a.write(bad)
+    with pytest.raises(RuntimeError):
+        with a.batch():
+            raise RuntimeError
+    b.write(lambda c: c.execute("insert into t values (1)"))
+
+
+def test_expired_lock_does_not_surface_lock_error(make_client):
+    a = make_client(listen=False, lock_timeout=0.1)
+    a.write(lambda c: c.execute("create table t(x)"))
+    with a.batch() as c:
+        c.execute("insert into t values (1)")
+        time.sleep(0.3)
+    a.write(lambda c: time.sleep(0.3))
+    assert a.query("select x from t") == [(1,)]

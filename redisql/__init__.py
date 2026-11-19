@@ -5,6 +5,8 @@ import threading
 import uuid
 import zlib
 
+from redis.exceptions import LockError
+
 log = logging.getLogger(__name__)
 
 # Push only if Redis still holds the version we built on. Atomic, so a stale writer can't clobber.
@@ -18,7 +20,7 @@ return 1
 
 
 class Conflict(Exception):
-    """Another client kept writing first; write() gave up after `retries` attempts."""
+    """Another client holds the Write lock, or kept writing first and write() gave up after `retries` attempts."""
 
 
 class RediSQL:
@@ -28,8 +30,10 @@ class RediSQL:
     socket_timeout (redis-py 8 defaults to 5s), otherwise a partition can hang the listener.
     """
 
-    def __init__(self, redis, name="redisql", poll=5, max_size=1 << 30, retries=5):
+    def __init__(self, redis, name="redisql", poll=5, max_size=1 << 30, retries=5, lock_timeout=30):
         self.redis, self.poll, self.max_size, self.retries = redis, poll, max_size, retries
+        self.lock_timeout = lock_timeout  # set above your longest write, or a second writer can get in
+        self._lock_key = f"{name}:lock"
         self._keys = [f"{name}:snap", f"{name}:ver", f"{name}:chan"]
         self._push = redis.register_script(_PUSH)
         # Versions are random tokens, not counters: a Redis flush or failover can't make
@@ -65,27 +69,44 @@ class RediSQL:
         with self._lock:
             return self._db.execute(sql, params).fetchall()
 
-    def write(self, fn):
+    def write(self, fn, lock=True):
         """Run fn(conn) on the latest snapshot and push the whole DB to Redis.
 
-        Local data changes only after Redis accepted the new snapshot. If another client wrote first,
+        Takes the Write lock and raises Conflict at once if another client holds it; lock=False
+        skips it (only safe with a single writer). Local data changes only after Redis accepted the new snapshot. If another client wrote first,
         sync and re-run fn (so fn may run more than once); raise Conflict after `retries` tries.
         """
-        for _ in range(self.retries):
-            pushed = self._copy_and_push(fn)
-            if pushed:
-                db, new, base = pushed
-                with self._lock:
-                    # If sync() already loaded a later version, it includes our push; keep that.
-                    if self.version == base:
-                        self._db, old = db, self._db
-                        old.close()
-                        self.version = new
-                    else:
-                        db.close()
-                return
-            self.sync()
+        with self._write_lock(lock):
+            for _ in range(self.retries):
+                pushed = self._copy_and_push(fn)
+                if pushed:
+                    db, new, base = pushed
+                    with self._lock:
+                        # If sync() already loaded a later version, it includes our push; keep that.
+                        if self.version == base:
+                            self._db, old = db, self._db
+                            old.close()
+                            self.version = new
+                        else:
+                            db.close()
+                    return
+                self.sync()
         raise Conflict(f"gave up after {self.retries} attempts")
+
+    @contextlib.contextmanager
+    def _write_lock(self, lock):
+        if not lock:
+            yield
+            return
+        redis_lock = self.redis.lock(self._lock_key, timeout=self.lock_timeout)
+        if not redis_lock.acquire(blocking=False):
+            raise Conflict("another client holds the write lock")
+        try:
+            self.sync()  # so the first attempt builds on current data
+            yield
+        finally:
+            with contextlib.suppress(LockError):  # lock_timeout passed: nothing left to release
+                redis_lock.release()
 
     def _copy_and_push(self, fn):
         """Run fn on a copy of the local DB and push it if Redis still holds the version we copied.
@@ -106,26 +127,29 @@ class RediSQL:
         db.close()
 
     @contextlib.contextmanager
-    def batch(self):
+    def batch(self, lock=True):
         """Yield a private copy of the local DB; on exit publish it as an Overwrite (last write wins).
 
+        Holds the Write lock for the whole block and raises Conflict at once if another client
+        holds it; lock=False skips it (only safe with a single writer).
         If the block raises, the copy is thrown away. query() and sync() keep working meanwhile.
         """
-        db, base = self._copy()
-        try:
-            with db:  # commits on success, rolls back if the block raises
-                yield db
-            raw, new, k = self._pack(db), uuid.uuid4().hex.encode(), self._keys
-            if (self.redis.get(k[1]) or b"") != base:
-                log.warning("batch overwrites changes another client made since it started")
-            self.redis.pipeline().set(k[0], raw).set(k[1], new).publish(k[2], new).execute()
-        except BaseException:
-            db.close()
-            raise
-        with self._lock:
-            self._db, old = db, self._db
-            old.close()
-            self.version = new
+        with self._write_lock(lock):
+            db, base = self._copy()
+            try:
+                with db:  # commits on success, rolls back if the block raises
+                    yield db
+                raw, new, k = self._pack(db), uuid.uuid4().hex.encode(), self._keys
+                if (self.redis.get(k[1]) or b"") != base:
+                    log.warning("batch overwrites changes another client made since it started")
+                self.redis.pipeline().set(k[0], raw).set(k[1], new).publish(k[2], new).execute()
+            except BaseException:
+                db.close()
+                raise
+            with self._lock:
+                self._db, old = db, self._db
+                old.close()
+                self.version = new
 
     def _copy(self):
         db = sqlite3.connect(":memory:", check_same_thread=False)
