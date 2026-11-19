@@ -21,28 +21,36 @@ Writes: `fn` runs on a copy of the latest snapshot. The copy is pushed with a co
 on the version, and replaces the local DB only once Redis accepted it, so a failed push changes
 nothing. If another client wrote first, `write` syncs and re-runs `fn` (so `fn` may run more than
 once and must only touch the connection it's given), raising `Conflict` after `retries` attempts.
-If Redis loses the data (flush, failover to an empty replica), clients keep their local copy and
-the next write re-seeds Redis. `query()` is read-only. Snapshots above `max_size` bytes
-uncompressed are rejected.
+`fn` and the push run without blocking `query()`. If Redis loses the data (flush, failover to an
+empty replica), clients keep their local copy and the next write re-seeds Redis. `query()` is
+read-only. Snapshots above `max_size` bytes uncompressed are rejected with `ValueError`, and
+Redis is left unchanged.
 
-Bulk writes: `local(fn)` changes only the local DB (call it as often as you like), then
-`snapshot()` pushes the whole DB once. Last write wins: `snapshot()` overwrites whatever Redis
-holds, including other clients' writes made meanwhile. While local changes are unpushed, `sync()`
-stops loading remote updates so they can't drop your work, and `write()` raises `Conflict` at once if
-another client wrote first; a successful `write()` pushes pending local changes too. `snapshot()`
-refuses a DB above `max_size`.
+Write lock: `write()` and `batch()` take a lock in Redis (`<name>:lock`) for the whole write, and
+sync to the latest snapshot once they have it. The lock is tried once: if another client holds it,
+they raise `Conflict` at once instead of waiting. Pass `lock=False` only when you are the single
+writer; it skips the lock and a `batch()` then overwrites whatever other clients wrote. The lock
+expires after `lock_timeout` seconds (default 30) so a crashed client can't block everyone. A write
+that runs longer than that lets a second writer in, so set `lock_timeout` above your longest write.
+
+Batches: `with db.batch() as c:` gives you a private copy of the DB. On exit it is published as a
+single Overwrite: last write wins, with no compare-and-set. If the block raises, the copy is
+thrown away and nothing changes. `query()` keeps returning the old data and sync keeps running
+while the block is open. With `lock=False`, a batch logs a warning when it erases another client's
+write (it still overwrites). A batch above `max_size` is rejected like a write.
 
 ```python
-db.local(lambda c: c.execute("create table if not exists t(x)"))
-for row in rows:
-    db.local(lambda c: c.execute("insert into t values (?)", row))
-db.snapshot()
+with db.batch() as c:
+    c.execute("create table if not exists t(x)")
+    for row in rows:
+        c.execute("insert into t values (?)", row)
 ```
 
-Limits: writers are serialized through Redis (contention means retries), the whole DB moves
-on every write and the lock blocks reads while it compresses,
-Redis caps a value at 512MB. Fits read-heavy data that changes rarely.
+Limits: writers are serialized through Redis (a held lock means `Conflict`), the whole DB moves
+on every write, Redis caps a value at 512MB. Fits read-heavy data that changes rarely.
 The redis client must not use `decode_responses=True` and must keep a `socket_timeout`
 (redis-py's default is 5s). Anyone who can write the Redis keys controls every client's data.
 
 Tests: `uv run pytest` (needs `redis-server` on PATH).
+
+Design: terms in [GLOSSARY.md](GLOSSARY.md), decisions in [docs/adr/](docs/adr/), planned work in [todo.md](todo.md).
