@@ -1,6 +1,9 @@
+import logging
 import sqlite3
 import threading
 import zlib
+
+log = logging.getLogger(__name__)
 
 
 class RediSQL:
@@ -9,21 +12,34 @@ class RediSQL:
     The redis client must not use decode_responses (snapshots are bytes).
     """
 
-    def __init__(self, redis, name="redisql"):
-        self.redis = redis
+    def __init__(self, redis, name="redisql", poll=5):
+        self.redis, self.poll = redis, poll
         self._snap, self._ver, self._chan = f"{name}:snap", f"{name}:ver", f"{name}:chan"
         self.version = 0
         self._lock = threading.RLock()
         self._db = sqlite3.connect(":memory:", check_same_thread=False)
+        self._stop = threading.Event()
         self._listener = self._pubsub = None
 
     def start(self, listen=True):
         if listen:
             self._pubsub = self.redis.pubsub()
-            self._pubsub.subscribe(**{self._chan: lambda _msg: self.sync()})
-            self._listener = self._pubsub.run_in_thread(sleep_time=0.05, daemon=True)
+            self._pubsub.subscribe(self._chan)
+            self._listener = threading.Thread(target=self._listen, daemon=True)
+            self._listener.start()
         self.sync()  # after subscribing, so no update falls in the gap
         return self
+
+    def _listen(self):
+        # Pubsub is the fast path. The sync() after every wait is the guarantee:
+        # it covers lost messages and reconnects, at the cost of one GET per `poll` seconds.
+        while not self._stop.is_set():
+            try:
+                self._pubsub.get_message(timeout=self.poll)  # redis-py resubscribes on reconnect
+                self.sync()
+            except Exception:
+                log.exception("redisql listener error, retrying")
+                self._stop.wait(min(self.poll, 1))
 
     def query(self, sql, params=()):
         with self._lock:
@@ -54,7 +70,7 @@ class RediSQL:
 
     def close(self):
         if self._listener:
-            self._listener.stop()
+            self._stop.set()
             self._listener.join()
             self._pubsub.close()
         self._db.close()

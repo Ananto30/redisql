@@ -8,11 +8,14 @@ other clients reload it. Reads are local and never hit the network.
 import redis
 from redisql import RediSQL
 
-db = RediSQL(redis.Redis(), "mydb").start()   # loads snapshot, subscribes to updates
+db = RediSQL(redis.Redis(), "mydb", poll=5).start()   # loads snapshot, listens for updates
 db.write(lambda c: c.execute("create table if not exists t(x)"))
 db.query("select * from t")
-db.sync()                                      # call after Redis reconnects: pubsub drops messages
 ```
+
+Delivery: pubsub pushes updates instantly. Pubsub can drop messages, so the listener thread
+also checks the Redis version every `poll` seconds, which reloads any missed update and
+recovers from Redis outages. Worst-case staleness is `poll` seconds. `close()` can block up to `poll` seconds.
 
 Limits: last write wins (no locking), the whole DB moves on every write,
 Redis caps a value at 512MB. Fits read-heavy data that changes rarely.

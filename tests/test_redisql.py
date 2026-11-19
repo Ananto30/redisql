@@ -35,7 +35,7 @@ def make_client(redis_server, request):
     clients = []
 
     def make(listen=True):
-        c = RediSQL(redis.Redis(port=redis_server), "t")
+        c = RediSQL(redis.Redis(port=redis_server), "t", poll=0.2)
         c.start(listen=listen)
         clients.append(c)
         return c
@@ -90,3 +90,19 @@ def test_failed_write_rolls_back(make_client):
     with pytest.raises(RuntimeError):
         a.write(bad)
     assert a.query("select x from t") == []
+
+
+def test_listener_converges_when_pubsub_message_is_lost(make_client):
+    a, b = make_client(), make_client()
+    a.redis.publish = lambda *args: 0  # the notification never reaches anyone
+    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (5)")))
+    assert wait_for(lambda: b.query("select x from t") if _has_table(b) else None) == [(5,)]
+
+
+def test_listener_survives_killed_pubsub_connection(make_client, redis_server):
+    a, b = make_client(), make_client()
+    time.sleep(0.2)
+    redis.Redis(port=redis_server).client_kill_filter(_type="pubsub")
+    time.sleep(0.5)
+    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (9)")))
+    assert wait_for(lambda: b.query("select x from t") if _has_table(b) else None) == [(9,)]
