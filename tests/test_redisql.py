@@ -171,6 +171,16 @@ def test_oversized_snapshot_rejected(make_client):
         b.start(listen=False)
     b.close()
 
+def test_oversized_write_rejected_and_redis_unchanged(make_client):
+    a, b = make_client(listen=False, max_size=50_000), make_client(listen=False)
+    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (1)")))
+    ver = a.redis.get("t:ver")
+    with pytest.raises(ValueError, match="max_size"):
+        a.write(lambda c: c.execute("insert into t values (zeroblob(100000))"))
+    assert a.redis.get("t:ver") == ver
+    assert a.query("select x from t") == [(1,)]
+    b.sync()
+    assert b.query("select x from t") == [(1,)]
 
 
 def test_local_writes_push_once_on_snapshot(make_client):

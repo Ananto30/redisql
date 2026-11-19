@@ -75,27 +75,39 @@ class RediSQL:
             with self._lock:
                 # fn runs on a copy that replaces our DB only once Redis has it, so a failed
                 # push or a conflict leaves local data untouched.
-                db = sqlite3.connect(":memory:", check_same_thread=False)
-                try:
-                    self._db.backup(db)
-                    with db:
-                        fn(db)
-                    db.execute("pragma query_only=1")
-                    new = uuid.uuid4().hex.encode()
-                    pushed = self._push(keys=self._keys, args=[self.version, zlib.compress(db.serialize()), new])
-                except BaseException:
-                    db.close()
-                    raise
-                if pushed:
+                db, new = self._copy_and_push(fn)
+                if db:
                     self._db, old = db, self._db
                     old.close()
                     self.version, self._dirty = new, False
                     return
-                db.close()
                 if self._dirty:  # sync() won't load past unpushed local() work, so retrying can't help
                     raise Conflict("another client wrote first; snapshot() to overwrite with local changes")
             self.sync()
         raise Conflict(f"gave up after {self.retries} attempts")
+
+    def _copy_and_push(self, fn):
+        """Run fn on a copy of the local DB and push it if Redis still holds our version.
+
+        Returns (copy, new version), or (None, None) if another client wrote first.
+        """
+        db = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            self._db.backup(db)
+            with db:
+                fn(db)
+            db.execute("pragma query_only=1")
+            raw = db.serialize()
+            if len(raw) > self.max_size:  # other clients would reject it on every sync
+                raise ValueError(f"snapshot larger than max_size={self.max_size}")
+            new = uuid.uuid4().hex.encode()
+            if self._push(keys=self._keys, args=[self.version, zlib.compress(raw), new]):
+                return db, new
+        except BaseException:
+            db.close()
+            raise
+        db.close()
+        return None, None
 
     def local(self, fn):
         """Run fn(conn) on the local DB only. Nothing reaches Redis until snapshot().
