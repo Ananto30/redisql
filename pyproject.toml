@@ -1,0 +1,14 @@
+[project]
+name = "redisql"
+version = "0.1.0"
+description = "In-memory sqlite replicated through Redis snapshots and pubsub"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["redis>=5"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
