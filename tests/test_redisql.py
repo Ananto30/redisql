@@ -204,33 +204,68 @@ def test_query_returns_while_write_fn_is_running(make_client):
     assert a.query("select x from t") == [(1,), (2,)]
 
 
-def test_local_writes_push_once_on_snapshot(make_client):
+def test_batch_publishes_once_on_exit(make_client):
     a, b = make_client(), make_client()
-    a.local(lambda c: c.execute("create table t(x)"))
-    for i in range(3):
-        a.local(lambda c, i=i: c.execute("insert into t values (?)", (i,)))
-    assert a.redis.get("t:ver") is None
-    a.snapshot()
-    assert wait_for(lambda: b.version == a.version)
-    assert b.query("select x from t") == [(0,), (1,), (2,)]
+    with a.batch() as c:
+        c.execute("create table t(x)")
+        for i in range(3):
+            c.execute("insert into t values (?)", (i,))
+        assert a.redis.get("t:ver") is None
+    assert wait_for(lambda: _rows(b) == [(0,), (1,), (2,)])
+    assert a.query("select x from t") == [(0,), (1,), (2,)]
 
 
-def test_snapshot_keeps_local_work_and_overwrites_remote(make_client):
+def test_batch_exception_throws_changes_away(make_client):
     a, b = make_client(), make_client()
-    a.local(lambda c: c.execute("create table mine(x)"))
-    b.write(lambda c: c.execute("create table theirs(x)"))
-    time.sleep(0.5)  # a's listener syncs meanwhile; must not drop unpushed work
-    assert a.query("select name from sqlite_master") == [("mine",)]
-    a.snapshot()
-    assert wait_for(lambda: b.query("select name from sqlite_master") == [("mine",)])
+    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (1)")))
+    ver = a.redis.get("t:ver")
+    with pytest.raises(RuntimeError):
+        with a.batch() as c:
+            c.execute("insert into t values (2)")
+            raise RuntimeError
+    assert a.query("select x from t") == [(1,)]
+    assert a.redis.get("t:ver") == ver
+    assert b.query("select x from t") == [(1,)]
 
 
-def test_write_with_unpushed_local_work_fails_fast_on_conflict(make_client):
-    a, b = make_client(listen=False), make_client()
-    a.local(lambda c: c.execute("create table mine(x)"))
-    b.write(lambda c: c.execute("create table theirs(x)"))
-    calls = []
-    with pytest.raises(Conflict):
-        a.write(lambda c: calls.append(1))
-    assert calls == [1]
-    assert a.query("select name from sqlite_master") == [("mine",)]
+def test_batch_keeps_query_and_sync_running_while_open(make_client):
+    a, b = make_client(), make_client()
+    a.write(lambda c: c.execute("create table t(x)"))
+    assert wait_for(lambda: _has_table(b))
+    with b.batch() as c:
+        c.execute("insert into t values (1)")
+        assert b.query("select x from t") == []  # batch work isn't visible yet
+        a.write(lambda c: c.execute("insert into t values (2)"))
+        assert wait_for(lambda: b.query("select x from t") == [(2,)])  # sync still loads remote writes
+
+
+def test_batch_warns_when_it_erases_another_clients_write(make_client, caplog):
+    a, b = make_client(listen=False), make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    b.sync()
+    with caplog.at_level("WARNING"):
+        with a.batch() as c:
+            b.write(lambda c: c.execute("insert into t values (1)"))
+            c.execute("insert into t values (2)")
+    assert "overwr" in caplog.text.lower()
+    assert make_client().query("select x from t") == [(2,)]
+
+
+def test_batch_without_interference_does_not_warn(make_client, caplog):
+    a = make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    with caplog.at_level("WARNING"):
+        with a.batch() as c:
+            c.execute("insert into t values (1)")
+    assert not caplog.records
+
+
+def test_oversized_batch_rejected(make_client):
+    a = make_client(listen=False, max_size=50_000)
+    a.write(lambda c: c.execute("create table t(x)"))
+    ver = a.redis.get("t:ver")
+    with pytest.raises(ValueError, match="max_size"):
+        with a.batch() as c:
+            c.execute("insert into t values (zeroblob(100000))")
+    assert a.redis.get("t:ver") == ver
+    assert a.query("select x from t") == []

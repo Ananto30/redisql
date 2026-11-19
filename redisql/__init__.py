@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import sqlite3
 import threading
@@ -37,7 +38,6 @@ class RediSQL:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(":memory:", check_same_thread=False)
         self._db.execute("pragma query_only=1")  # query() can't change local data behind Redis' back
-        self._dirty = False  # local() changes not yet pushed; sync() leaves them alone
         self._stop = threading.Event()
         self._listener = self._pubsub = None
 
@@ -80,12 +80,10 @@ class RediSQL:
                     if self.version == base:
                         self._db, old = db, self._db
                         old.close()
-                        self.version, self._dirty = new, False
+                        self.version = new
                     else:
                         db.close()
                 return
-            if self._dirty:  # sync() won't load past unpushed local() work, so retrying can't help
-                raise Conflict("another client wrote first; snapshot() to overwrite with local changes")
             self.sync()
         raise Conflict(f"gave up after {self.retries} attempts")
 
@@ -95,58 +93,62 @@ class RediSQL:
         Returns (copy, new version, base version), or None if another client wrote first.
         The lock is held only while copying, so query() isn't blocked while fn runs or the push happens.
         """
-        db = sqlite3.connect(":memory:", check_same_thread=False)
+        db, base = self._copy()
         try:
-            with self._lock:
-                base = self.version
-                self._db.backup(db)
             with db:
                 fn(db)
-            db.execute("pragma query_only=1")
-            raw = db.serialize()
-            if len(raw) > self.max_size:  # other clients would reject it on every sync
-                raise ValueError(f"snapshot larger than max_size={self.max_size}")
             new = uuid.uuid4().hex.encode()
-            if self._push(keys=self._keys, args=[base, zlib.compress(raw), new]):
+            if self._push(keys=self._keys, args=[base, self._pack(db), new]):
                 return db, new, base
         except BaseException:
             db.close()
             raise
         db.close()
 
-    def local(self, fn):
-        """Run fn(conn) on the local DB only. Nothing reaches Redis until snapshot().
+    @contextlib.contextmanager
+    def batch(self):
+        """Yield a private copy of the local DB; on exit publish it as an Overwrite (last write wins).
 
-        Until then sync() stops loading remote updates, so they can't drop this work.
+        If the block raises, the copy is thrown away. query() and sync() keep working meanwhile.
         """
+        db, base = self._copy()
+        try:
+            with db:  # commits on success, rolls back if the block raises
+                yield db
+            raw, new, k = self._pack(db), uuid.uuid4().hex.encode(), self._keys
+            if (self.redis.get(k[1]) or b"") != base:
+                log.warning("batch overwrites changes another client made since it started")
+            self.redis.pipeline().set(k[0], raw).set(k[1], new).publish(k[2], new).execute()
+        except BaseException:
+            db.close()
+            raise
         with self._lock:
-            self._dirty = True  # before fn: DDL autocommits, so even a failed fn can leave changes
-            self._db.execute("pragma query_only=0")
-            try:
-                with self._db:
-                    fn(self._db)
-            finally:
-                self._db.execute("pragma query_only=1")
+            self._db, old = db, self._db
+            old.close()
+            self.version = new
 
-    def snapshot(self):
-        """Push the local DB to Redis in one go. Last write wins: overwrites whatever Redis holds."""
+    def _copy(self):
+        db = sqlite3.connect(":memory:", check_same_thread=False)
         with self._lock:
-            new = uuid.uuid4().hex.encode()
-            raw = self._db.serialize()
-            if len(raw) > self.max_size:  # other clients would reject it on every sync
-                raise ValueError(f"snapshot larger than max_size={self.max_size}")
-            k = self._keys
-            self.redis.pipeline().set(k[0], zlib.compress(raw)).set(k[1], new).publish(k[2], new).execute()
-            self.version, self._dirty = new, False
+            self._db.backup(db)
+            return db, self.version
+
+    def _pack(self, db):
+        """Freeze db as the next local DB and return its compressed snapshot."""
+        db.execute("pragma query_only=1")
+        raw = db.serialize()
+        if len(raw) > self.max_size:  # other clients would reject it on every sync
+            raise ValueError(f"snapshot larger than max_size={self.max_size}")
+        return zlib.compress(raw)
 
     def sync(self):
         """Load the snapshot if Redis holds a different version than ours."""
         seen = self.version
-        if self._dirty or (self.redis.get(self._keys[1]) or b"") == seen:
+        if (self.redis.get(self._keys[1]) or b"") == seen:
             return
         data, ver = self.redis.pipeline().get(self._keys[0]).get(self._keys[1]).execute()
         with self._lock:
-            if self._dirty or self.version != seen:  # a local write landed meanwhile; next sync rechecks
+            if self.version != seen:  # a local write landed meanwhile; next sync rechecks
                 return
             if data is None:
                 # Redis lost the snapshot (flush, failover to empty replica). Keep local data;
