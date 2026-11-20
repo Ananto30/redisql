@@ -1,10 +1,14 @@
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
+import os
+import socket
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 import zlib
 
@@ -49,6 +53,13 @@ class RediSQL:
         # Versions are random tokens, not counters: a Redis flush or failover can't make
         # an old number look current again.
         self.version = b""
+        self._synced_at = self._changed_at = self._error = None  # for stats()
+        self._stats_prefix = f"{name}:stats:"
+        # Unique per instance, so two clients in one process don't overwrite each other.
+        self._stats_key = (
+            f"{self._stats_prefix}{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:4]}"
+        )
+        self._published_at = 0
         self._lock = threading.RLock()
         self._db = sqlite3.connect(":memory:", check_same_thread=False)
         # Local data may only change through Redis, so query() can't write.
@@ -63,6 +74,8 @@ class RediSQL:
             self._listener = threading.Thread(target=self._listen, daemon=True)
             self._listener.start()
         self.sync()  # after subscribing, so no update falls in the gap
+        if listen:
+            self._publish_stats()
         return self
 
     def _listen(self):
@@ -72,13 +85,78 @@ class RediSQL:
             try:
                 self._pubsub.get_message(timeout=self.poll)  # redis-py resubscribes on reconnect
                 self.sync()
-            except Exception:
+                self._error = None
+                self._publish_stats()
+            except Exception as e:
+                self._error = repr(e)
                 log.exception("redisql listener error, retrying")
                 self._stop.wait(min(self.poll, 1))
 
     def query(self, sql, params=()):
         with self._lock:
             return self._db.execute(sql, params).fetchall()
+
+    def stats(self):
+        """Local state as a dict. No Redis call, so it's cheap enough for a health endpoint.
+
+        size_bytes is the DB size, which is what the in-memory copy costs. The `*_ago` values are
+        seconds, None if it hasn't happened yet: compare synced_ago to `poll` to spot a stale
+        client. last_error is the listener's latest failure, cleared once it recovers.
+        """
+        with self._lock:
+            pages, page_size = (
+                self._db.execute(f"pragma {p}").fetchone()[0] for p in ("page_count", "page_size")
+            )
+            tables = [
+                r[0] for r in self._db.execute("select name from sqlite_master where type='table'")
+            ]
+            version = self.version.decode()
+        now = time.time()
+        return {
+            "version": version,
+            "size_bytes": pages * page_size,
+            "max_size": self.max_size,
+            "tables": tables,
+            "listening": bool(self._listener and self._listener.is_alive()),
+            "poll": self.poll,
+            "synced_ago": self._synced_at and now - self._synced_at,
+            "changed_ago": self._changed_at and now - self._changed_at,
+            "last_error": self._error,
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+        }
+
+    def _publish_stats(self):
+        # The key expires after 3 missed polls, so a dead worker drops out of fleet_stats().
+        if time.time() - self._published_at < self.poll:
+            return
+        self._published_at = time.time()
+        self.redis.set(self._stats_key, json.dumps(self.stats()), px=int(self.poll * 3000))
+
+    def fleet_stats(self):
+        """stats() of every listening client, from Redis: {"total": {...}, "workers": {id: stats}}.
+
+        Each client republishes every `poll` seconds, so a worker's numbers are up to `poll` old,
+        and one that stopped (crashed, partitioned) disappears after 3 polls. Clients started
+        with listen=False don't publish. total.in_sync is False while versions differ, which is
+        normal for a moment after each write.
+        """
+        keys = list(self.redis.scan_iter(f"{self._stats_prefix}*"))
+        raw = self.redis.mget(keys) if keys else []
+        workers = {
+            k.decode().removeprefix(self._stats_prefix): json.loads(v)
+            for k, v in zip(keys, raw, strict=True)
+            if v
+        }
+        versions = sorted({w["version"] for w in workers.values()})
+        total = {
+            "workers": len(workers),
+            "versions": versions,
+            "in_sync": len(versions) <= 1,
+            "size_bytes": sum(w["size_bytes"] for w in workers.values()),
+            "with_errors": sum(bool(w["last_error"]) for w in workers.values()),
+        }
+        return {"total": total, "workers": workers}
 
     def write(self, fn, lock=True):
         """Run fn(conn) on the latest snapshot and push the whole DB to Redis.
@@ -98,7 +176,7 @@ class RediSQL:
                         if self.version == base:
                             self._db, old = db, self._db
                             old.close()
-                            self.version = new
+                            self.version, self._changed_at = new, time.time()
                         else:
                             db.close()
                     return
@@ -164,7 +242,7 @@ class RediSQL:
             with self._lock:
                 self._db, old = db, self._db
                 old.close()
-                self.version = new
+                self.version, self._changed_at = new, time.time()
 
     async def awrite(self, fn, lock=True):
         """write() without blocking the event loop. fn may be a plain function or an `async def`.
@@ -218,6 +296,7 @@ class RediSQL:
         """Load the snapshot if Redis holds a different version than ours."""
         seen = self.version
         if (self.redis.get(self._keys[1]) or b"") == seen:
+            self._synced_at = time.time()
             return
         data, ver = self.redis.pipeline().get(self._keys[0]).get(self._keys[1]).execute()
         with self._lock:
@@ -227,9 +306,11 @@ class RediSQL:
                 # Redis lost the snapshot (flush, failover to empty replica). Keep local data;
                 # the next write re-seeds Redis and every client reloads from it.
                 self.version = b""
+                self._synced_at = time.time()
                 return
             self._db.deserialize(self._decompress(data))
             self.version = ver
+            self._synced_at = self._changed_at = time.time()
 
     def _decompress(self, data):
         d = zlib.decompressobj()
@@ -243,4 +324,6 @@ class RediSQL:
             self._stop.set()
             self._listener.join(self.poll + 5)
             self._pubsub.close()
+            with contextlib.suppress(Exception):  # Redis may be gone; the key expires anyway
+                self.redis.delete(self._stats_key)
         self._db.close()

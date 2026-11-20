@@ -73,6 +73,32 @@ def _has_table(c):
     return bool(c.query("select 1 from sqlite_master where name='t'"))
 
 
+def test_stats_tracks_version_size_and_sync(make_client):
+    a, b = make_client(), make_client(listen=False)
+    s = a.stats()
+    assert s["listening"] and s["tables"] == [] and s["changed_ago"] is None
+    a.write(lambda c: c.execute("create table t(x)"))
+    s = a.stats()
+    assert s["tables"] == ["t"] and s["size_bytes"] > 0 and s["version"] == a.version.decode()
+    assert s["changed_ago"] < 3 and s["synced_ago"] < 3 and s["last_error"] is None
+    assert not b.stats()["listening"]
+    b.sync()
+    assert b.stats()["version"] == s["version"]
+
+
+def test_fleet_stats_lists_listening_clients_and_drops_closed_ones(make_client):
+    a, b = make_client(), make_client()
+    make_client(listen=False)
+    a.write(lambda c: c.execute("create table t(x)"))
+    assert wait_for(lambda: a.fleet_stats()["total"]["versions"] == [a.version.decode()])
+    f = a.fleet_stats()
+    assert f["total"]["workers"] == 2 and f["total"]["in_sync"]
+    assert f["total"]["size_bytes"] == 2 * a.stats()["size_bytes"]
+    assert all(w["pid"] == a.stats()["pid"] for w in f["workers"].values())
+    b.close()
+    assert wait_for(lambda: a.fleet_stats()["total"]["workers"] == 1)
+
+
 def test_late_joiner_loads_existing_snapshot(make_client):
     a = make_client()
     a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (7)")))
