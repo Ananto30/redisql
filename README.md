@@ -17,9 +17,8 @@ db.query("select * from t")
 
 - **Updates:** pubsub delivers them instantly. A listener also checks the version every `poll`
   seconds (default 5), so a dropped message or Redis outage heals itself.
-- **`write(fn)`:** runs `fn` on a copy of the latest snapshot and pushes it only if nobody wrote
-  first. If someone did, it syncs and runs `fn` again, so `fn` must only touch the connection it
-  gets. After `retries` attempts it raises `Conflict`.
+- **`write(fn)`:** runs `fn` on a copy of the latest snapshot and publishes it as an overwrite,
+  like a one-statement `batch()`. Last write wins, and `fn` runs once.
 - **`query()`:** read-only and never blocked by writes.
 - **`stats()`:** a dict of local state for health endpoints: `version`, `size_bytes`, `tables`,
   `listening`, `synced_ago`, `changed_ago` (seconds) and `last_error`. It makes no Redis call.

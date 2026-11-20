@@ -24,6 +24,14 @@ _Avoid_: snapshot (as a verb), force push
 A group of changes a client makes in one go and publishes as a single Overwrite.
 _Avoid_: bulk write, local write
 
+**Snapshot store**:
+The one place that reads and replaces the Snapshot in Redis and announces each new Version.
+_Avoid_: redis layer, persistence
+
+**Stats**:
+What a client reports about its Local copy and sync health; the fleet's Stats are every listening client's report read from Redis.
+_Avoid_: metrics, health
+
 **Write lock**:
 A lock held in Redis that lets one client at a time change the Snapshot.
 _Avoid_: mutex, distributed lock
