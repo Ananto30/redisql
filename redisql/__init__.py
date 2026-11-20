@@ -1,6 +1,9 @@
+import asyncio
 import contextlib
+import inspect
 import logging
 import sqlite3
+import sys
 import threading
 import uuid
 import zlib
@@ -98,7 +101,8 @@ class RediSQL:
         if not lock:
             yield
             return
-        redis_lock = self.redis.lock(self._lock_key, timeout=self.lock_timeout)
+        # thread_local=False: abatch() acquires and releases from different worker threads
+        redis_lock = self.redis.lock(self._lock_key, timeout=self.lock_timeout, thread_local=False)
         if not redis_lock.acquire(blocking=False):
             raise Conflict("another client holds the write lock")
         try:
@@ -150,6 +154,34 @@ class RediSQL:
                 self._db, old = db, self._db
                 old.close()
                 self.version = new
+
+    async def awrite(self, fn, lock=True):
+        """write() without blocking the event loop. fn may be a plain function or an `async def`.
+
+        An async fn runs on the caller's event loop (so it can await your async clients) while
+        the Redis I/O stays in a worker thread. Like write(), fn may run more than once.
+        """
+        if inspect.iscoroutinefunction(fn):
+            loop, afn = asyncio.get_running_loop(), fn
+            fn = lambda db: asyncio.run_coroutine_threadsafe(afn(db), loop).result()
+        await asyncio.to_thread(self.write, fn, lock)
+
+    @contextlib.asynccontextmanager
+    async def abatch(self, lock=True):
+        """batch() for async code: `async with db.abatch() as c:` lets the block await.
+
+        Redis I/O runs in worker threads, so the event loop stays free. Use c (a plain sqlite
+        connection) only from the block itself. The Write lock is held while the block awaits,
+        so keep awaits short compared to lock_timeout.
+        """
+        cm = self.batch(lock)
+        db = await asyncio.to_thread(cm.__enter__)
+        try:
+            yield db
+        except BaseException:
+            await asyncio.to_thread(cm.__exit__, *sys.exc_info())
+            raise
+        await asyncio.to_thread(cm.__exit__, None, None, None)
 
     def _copy(self):
         db = sqlite3.connect(":memory:", check_same_thread=False)

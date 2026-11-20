@@ -333,3 +333,39 @@ def test_expired_lock_does_not_surface_lock_error(make_client):
         time.sleep(0.3)
     a.write(lambda c: time.sleep(0.3))
     assert a.query("select x from t") == [(1,)]
+
+
+def test_abatch_awaits_inside_block_and_publishes(make_client):
+    import asyncio
+
+    a, b = make_client(), make_client()
+
+    async def go():
+        async with a.abatch() as c:
+            c.execute("create table t(x)")
+            await asyncio.sleep(0.05)
+            c.execute("insert into t values (1)")
+        with pytest.raises(RuntimeError):
+            async with a.abatch() as c:
+                c.execute("insert into t values (2)")
+                raise RuntimeError
+        await a.awrite(lambda c: c.execute("insert into t values (3)"))
+
+    asyncio.run(go())
+    assert a.query("select x from t") == [(1,), (3,)]
+    assert wait_for(lambda: _rows(b) == [(1,), (3,)])
+    assert a.redis.get("t:lock") is None  # lock released from a different thread
+
+
+def test_awrite_accepts_async_fn(make_client):
+    import asyncio
+
+    a = make_client()
+
+    async def fn(c):
+        await asyncio.sleep(0.01)
+        c.execute("create table t(x)")
+        c.execute("insert into t values (1)")
+
+    asyncio.run(a.awrite(fn))
+    assert a.query("select x from t") == [(1,)]
