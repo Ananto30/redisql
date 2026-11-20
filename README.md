@@ -74,6 +74,22 @@ async with db.abatch() as c:
 - The redis client needs `decode_responses=False` and a `socket_timeout`.
 - Anyone who can write the Redis keys controls every client's data.
 
+## Read benchmark
+
+With Redis running, measure local read throughput at several thread concurrency levels:
+
+```bash
+uv run python -m benchmarks.read_concurrency \
+  --concurrency 1,4,16,64 \
+  --duration 10 \
+  --rows 100000 \
+  --output read-benchmark.csv
+```
+
+The CSV records completed requests, errors, RPS, and latency percentiles for each concurrency
+level. This measures threads inside one process; repeat it with the same CPU and data size as the
+FastAPI deployment being evaluated.
+
 ## Development
 
 `uv run pytest` (needs `redis-server` on PATH). Lint and format: `uv run ruff check --fix . && uv run ruff format .`.
