@@ -62,5 +62,6 @@ async with db.abatch() as c:
 
 ## Development
 
-`uv run pytest` (needs `redis-server` on PATH). See [GLOSSARY.md](GLOSSARY.md),
+`uv run pytest` (needs `redis-server` on PATH). Lint and format: `uv run ruff check --fix . && uv run ruff format .`.
+See [GLOSSARY.md](GLOSSARY.md),
 [docs/adr/](docs/adr/) and [todo.md](todo.md).

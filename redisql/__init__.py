@@ -12,7 +12,9 @@ from redis.exceptions import LockError
 
 log = logging.getLogger(__name__)
 
-# Push only if Redis still holds the version we built on. Atomic, so a stale writer can't clobber.
+# Compare-and-set push. KEYS: snapshot, version, channel. ARGV: expected version, new snapshot,
+# new version. Runs atomically in Redis, so a stale writer can't overwrite a newer snapshot.
+# Returns 1 if pushed, 0 if Redis holds a different version than expected.
 _PUSH = """
 if (redis.call('get', KEYS[2]) or '') ~= ARGV[1] then return 0 end
 redis.call('set', KEYS[1], ARGV[2])
@@ -23,7 +25,11 @@ return 1
 
 
 class Conflict(Exception):
-    """Another client holds the Write lock, or kept writing first and write() gave up after `retries` attempts."""
+    """Write was refused.
+
+    Either another client holds the Write lock, or other clients kept writing first and
+    write() gave up after `retries` attempts.
+    """
 
 
 class RediSQL:
@@ -35,7 +41,8 @@ class RediSQL:
 
     def __init__(self, redis, name="redisql", poll=5, max_size=1 << 30, retries=5, lock_timeout=30):
         self.redis, self.poll, self.max_size, self.retries = redis, poll, max_size, retries
-        self.lock_timeout = lock_timeout  # set above your longest write, or a second writer can get in
+        # Set above your longest write, or the lock expires and a second writer can get in.
+        self.lock_timeout = lock_timeout
         self._lock_key = f"{name}:lock"
         self._keys = [f"{name}:snap", f"{name}:ver", f"{name}:chan"]
         self._push = redis.register_script(_PUSH)
@@ -44,7 +51,8 @@ class RediSQL:
         self.version = b""
         self._lock = threading.RLock()
         self._db = sqlite3.connect(":memory:", check_same_thread=False)
-        self._db.execute("pragma query_only=1")  # query() can't change local data behind Redis' back
+        # Local data may only change through Redis, so query() can't write.
+        self._db.execute("pragma query_only=1")
         self._stop = threading.Event()
         self._listener = self._pubsub = None
 
@@ -76,8 +84,9 @@ class RediSQL:
         """Run fn(conn) on the latest snapshot and push the whole DB to Redis.
 
         Takes the Write lock and raises Conflict at once if another client holds it; lock=False
-        skips it (only safe with a single writer). Local data changes only after Redis accepted the new snapshot. If another client wrote first,
-        sync and re-run fn (so fn may run more than once); raise Conflict after `retries` tries.
+        skips it (only safe with a single writer). Local data changes only after Redis accepted
+        the new snapshot. If another client wrote first, sync and re-run fn (so fn may run more
+        than once); raise Conflict after `retries` tries.
         """
         with self._write_lock(lock):
             for _ in range(self.retries):
@@ -116,7 +125,8 @@ class RediSQL:
         """Run fn on a copy of the local DB and push it if Redis still holds the version we copied.
 
         Returns (copy, new version, base version), or None if another client wrote first.
-        The lock is held only while copying, so query() isn't blocked while fn runs or the push happens.
+        The local lock is held only while copying, so query() isn't blocked while fn runs or
+        the push happens.
         """
         db, base = self._copy()
         try:
@@ -132,11 +142,12 @@ class RediSQL:
 
     @contextlib.contextmanager
     def batch(self, lock=True):
-        """Yield a private copy of the local DB; on exit publish it as an Overwrite (last write wins).
+        """Yield a private copy of the local DB; on exit publish it as an Overwrite.
 
-        Holds the Write lock for the whole block and raises Conflict at once if another client
-        holds it; lock=False skips it (only safe with a single writer).
-        If the block raises, the copy is thrown away. query() and sync() keep working meanwhile.
+        Overwrite means last write wins, with no version check. Holds the Write lock for the
+        whole block and raises Conflict at once if another client holds it; lock=False skips it
+        (only safe with a single writer). If the block raises, the copy is thrown away.
+        query() and sync() keep working meanwhile.
         """
         with self._write_lock(lock):
             db, base = self._copy()
@@ -163,7 +174,11 @@ class RediSQL:
         """
         if inspect.iscoroutinefunction(fn):
             loop, afn = asyncio.get_running_loop(), fn
-            fn = lambda db: asyncio.run_coroutine_threadsafe(afn(db), loop).result()
+
+            def fn(db):
+                # write() runs in a worker thread; hand the coroutine back to the loop and wait.
+                return asyncio.run_coroutine_threadsafe(afn(db), loop).result()
+
         await asyncio.to_thread(self.write, fn, lock)
 
     @contextlib.asynccontextmanager
@@ -174,11 +189,13 @@ class RediSQL:
         connection) only from the block itself. The Write lock is held while the block awaits,
         so keep awaits short compared to lock_timeout.
         """
+        # Drive the sync context manager by hand so its blocking enter/exit run off the loop.
         cm = self.batch(lock)
         db = await asyncio.to_thread(cm.__enter__)
         try:
             yield db
         except BaseException:
+            # Let batch() see the error so it discards the copy and releases the lock.
             await asyncio.to_thread(cm.__exit__, *sys.exc_info())
             raise
         await asyncio.to_thread(cm.__exit__, None, None, None)

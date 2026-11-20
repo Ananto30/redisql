@@ -37,7 +37,14 @@ def make_client(redis_server, request):
     clients = []
 
     def make(listen=True, **kw):
-        c = RediSQL(redis.Redis(port=redis_server, ), "t", poll=0.2, **kw)
+        c = RediSQL(
+            redis.Redis(
+                port=redis_server,
+            ),
+            "t",
+            poll=0.2,
+            **kw,
+        )
         c.start(listen=listen)
         clients.append(c)
         return c
@@ -50,7 +57,7 @@ def make_client(redis_server, request):
 def wait_for(fn, timeout=3):
     end = time.time() + timeout
     while time.time() < end:
-        if (v := fn()):
+        if v := fn():
             return v
         time.sleep(0.02)
     return fn()
@@ -117,7 +124,12 @@ def _rows(c):
 def test_clients_resync_after_redis_loses_data(make_client, redis_server):
     a, b = make_client(), make_client()
     for i in range(3):
-        a.write(lambda c, i=i: c.execute("create table if not exists t(x)") and c.execute("insert into t values (?)", (i,)))
+        a.write(
+            lambda c, i=i: (
+                c.execute("create table if not exists t(x)")
+                and c.execute("insert into t values (?)", (i,))
+            )
+        )
     assert wait_for(lambda: _rows(b) == [(0,), (1,), (2,)])
     redis.Redis(port=redis_server).flushall()
     a.write(lambda c: c.execute("insert into t values (99)"))
@@ -166,11 +178,17 @@ def test_query_cannot_write(make_client):
 
 def test_oversized_snapshot_rejected(make_client):
     a = make_client(listen=False)
-    a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (zeroblob(100000))")))
+    a.write(
+        lambda c: (
+            c.execute("create table t(x)"),
+            c.execute("insert into t values (zeroblob(100000))"),
+        )
+    )
     b = RediSQL(a.redis, "t", max_size=1000)
     with pytest.raises(ValueError, match="max_size"):
         b.start(listen=False)
     b.close()
+
 
 def test_oversized_write_rejected_and_redis_unchanged(make_client):
     a, b = make_client(listen=False, max_size=50_000), make_client(listen=False)
@@ -219,10 +237,9 @@ def test_batch_exception_throws_changes_away(make_client):
     a, b = make_client(), make_client()
     a.write(lambda c: (c.execute("create table t(x)"), c.execute("insert into t values (1)")))
     ver = a.redis.get("t:ver")
-    with pytest.raises(RuntimeError):
-        with a.batch() as c:
-            c.execute("insert into t values (2)")
-            raise RuntimeError
+    with pytest.raises(RuntimeError), a.batch() as c:
+        c.execute("insert into t values (2)")
+        raise RuntimeError
     assert a.query("select x from t") == [(1,)]
     assert a.redis.get("t:ver") == ver
     assert b.query("select x from t") == [(1,)]
@@ -236,17 +253,17 @@ def test_batch_keeps_query_and_sync_running_while_open(make_client):
         c.execute("insert into t values (1)")
         assert b.query("select x from t") == []  # batch work isn't visible yet
         a.write(lambda c: c.execute("insert into t values (2)"), lock=False)
-        assert wait_for(lambda: b.query("select x from t") == [(2,)])  # sync still loads remote writes
+        # sync still loads remote writes
+        assert wait_for(lambda: b.query("select x from t") == [(2,)])
 
 
 def test_batch_warns_when_it_erases_another_clients_write(make_client, caplog):
     a, b = make_client(listen=False), make_client(listen=False)
     a.write(lambda c: c.execute("create table t(x)"))
     b.sync()
-    with caplog.at_level("WARNING"):
-        with a.batch() as c:
-            b.write(lambda c: c.execute("insert into t values (1)"), lock=False)
-            c.execute("insert into t values (2)")
+    with caplog.at_level("WARNING"), a.batch() as c:
+        b.write(lambda c: c.execute("insert into t values (1)"), lock=False)
+        c.execute("insert into t values (2)")
     assert "overwr" in caplog.text.lower()
     assert make_client().query("select x from t") == [(2,)]
 
@@ -254,9 +271,8 @@ def test_batch_warns_when_it_erases_another_clients_write(make_client, caplog):
 def test_batch_without_interference_does_not_warn(make_client, caplog):
     a = make_client(listen=False)
     a.write(lambda c: c.execute("create table t(x)"))
-    with caplog.at_level("WARNING"):
-        with a.batch() as c:
-            c.execute("insert into t values (1)")
+    with caplog.at_level("WARNING"), a.batch() as c:
+        c.execute("insert into t values (1)")
     assert not caplog.records
 
 
@@ -264,9 +280,8 @@ def test_oversized_batch_rejected(make_client):
     a = make_client(listen=False, max_size=50_000)
     a.write(lambda c: c.execute("create table t(x)"))
     ver = a.redis.get("t:ver")
-    with pytest.raises(ValueError, match="max_size"):
-        with a.batch() as c:
-            c.execute("insert into t values (zeroblob(100000))")
+    with pytest.raises(ValueError, match="max_size"), a.batch() as c:
+        c.execute("insert into t values (zeroblob(100000))")
     assert a.redis.get("t:ver") == ver
     assert a.query("select x from t") == []
 
@@ -279,9 +294,8 @@ def test_second_client_gets_conflict_while_write_lock_is_held(make_client):
     with a.batch():
         with pytest.raises(Conflict):
             b.write(lambda c: calls.append(1))
-        with pytest.raises(Conflict):
-            with b.batch():
-                calls.append(1)
+        with pytest.raises(Conflict), b.batch():
+            calls.append(1)
     assert calls == []
     b.write(lambda c: c.execute("insert into t values (1)"))  # lock was released
 
@@ -301,9 +315,8 @@ def test_locked_batch_builds_on_latest_snapshot(make_client, caplog):
     a.write(lambda c: c.execute("create table t(x)"))
     b.sync()
     a.write(lambda c: c.execute("insert into t values (1)"))  # b hasn't seen this
-    with caplog.at_level("WARNING"):
-        with b.batch() as c:
-            c.execute("insert into t values (2)")
+    with caplog.at_level("WARNING"), b.batch() as c:
+        c.execute("insert into t values (2)")
     assert not caplog.records
     a.sync()
     assert sorted(a.query("select x from t")) == [(1,), (2,)]
@@ -319,9 +332,8 @@ def test_lock_released_when_write_or_batch_fails(make_client):
 
     with pytest.raises(RuntimeError):
         a.write(bad)
-    with pytest.raises(RuntimeError):
-        with a.batch():
-            raise RuntimeError
+    with pytest.raises(RuntimeError), a.batch():
+        raise RuntimeError
     b.write(lambda c: c.execute("insert into t values (1)"))
 
 
