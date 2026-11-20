@@ -12,6 +12,20 @@ db.write(lambda c: c.execute("create table if not exists t(x)"))
 db.query("select * from t")
 ```
 
+## Product catalog example
+
+With Redis running locally, run `uv run python -m examples.product_catalog` from the repo root.
+Set `REDIS_URL` if Redis is elsewhere.
+
+Follow `run_demo()` in [product_catalog.py](examples/product_catalog.py) alongside the output:
+
+1. **Publish:** The shop inserts 10,000 products in one `batch()`, which publishes one snapshot.
+2. **Query:** The storefront loads that snapshot and uses `query()` on its local copy. It filters
+   by name and color, sorts by price, and prints the three cheapest red trail backpacks.
+3. **Update:** The shop uses `write()` to change Trail Backpack 0001 from blue to red.
+4. **Query again:** The storefront calls `sync()` to load the updated snapshot without waiting
+   for Pub/Sub. The same query now lists Trail Backpack 0001 first, at $20.00.
+
 ## How it works
 
 - **Updates:** pubsub delivers them instantly. A listener also checks the version every `poll`
